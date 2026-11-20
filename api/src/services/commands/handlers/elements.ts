@@ -1,6 +1,7 @@
 import { realpath, stat } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import type { Command } from "../commands.js";
+import { dialogHint, type Dialog } from "../dialogs.js";
 import { CommandError, withEffect } from "../errors.js";
 import { axString } from "../ax.js";
 import {
@@ -14,7 +15,7 @@ import {
   SET_PICKER,
   TOGGLE_INPUT,
 } from "../forms.js";
-import { chordStroke, insertText, press as pressKey, typeText } from "../keyboard.js";
+import { dialogAnswer, insertText, press as pressKey, typeText } from "../keyboard.js";
 import {
   actionPoint,
   attached,
@@ -27,21 +28,25 @@ import { ENABLED } from "../reads.js";
 import type { CommandResult } from "../records.js";
 import type { Tab } from "../tabs.js";
 import { callIn, callOn, type Element } from "../targets.js";
+import { STEP_MS } from "../session.js";
 import {
   activate,
   dialogNote,
   element,
   inputs,
+  openDialogOn,
   scopeFor,
   sleep,
   tabFor,
   touch,
+  useTab,
+  waitWithin,
   type Context,
 } from "./context.js";
 
 export async function pointer(
   ctx: Context,
-  command: Extract<Command, { command: "click" | "dblclick" | "hover" }>,
+  command: Extract<Command, { command: "click" | "hover" }>,
 ): Promise<CommandResult> {
   const target = await element(ctx, command);
   if (command.command !== "hover") {
@@ -58,7 +63,8 @@ export async function pointer(
       target.session,
       point,
       () => confirmTarget(target, point),
-      command.command === "dblclick" ? 2 : 1,
+      command.clicks,
+      command.button,
     );
   }
   return { ok: true, effect: "applied", ...dialogNote(ctx.active, target.tab) };
@@ -126,7 +132,7 @@ export async function write(
     if (prepared.end && (await pressKey(context, session, "End"))) {
       throw new CommandError(
         "dialog_pending",
-        "A dialog opened before typing started. Close it, then type again.",
+        `A dialog opened before typing started. ${dialogHint()} Then type again.`,
         "during_type",
         "applied",
       );
@@ -146,11 +152,99 @@ export async function write(
   return { ok: true, effect: "applied", ...dialogNote(ctx.active, target.tab) };
 }
 
+async function answer(
+  ctx: Context,
+  command: Extract<Command, { command: "press" }>,
+): Promise<CommandResult | null> {
+  const accept = dialogAnswer(command.key);
+  if (accept === undefined || command.target !== undefined) {
+    return null;
+  }
+  const tab = ctx.active.tabs.resolve(command.tab);
+  const open = tab.blocking ? openDialogOn(ctx.active, tab.id) : undefined;
+  if (!open) {
+    return null;
+  }
+  useTab(ctx, tab.id);
+  const text = accept && open.type === "prompt" ? open.defaultPrompt ?? "" : undefined;
+  await closeDialog(ctx, tab, open, accept, text);
+  return { ok: true, effect: "applied", answered: open.id, ...dialogNote(ctx.active, tab) };
+}
+
+export async function dialog(
+  ctx: Context,
+  command: Extract<Command, { command: "dialog" }>,
+): Promise<CommandResult> {
+  const found = ctx.active.dialogs.get(command.dialog);
+  const tab = found ? ctx.active.tabs.get(found.tab) : undefined;
+  if (tab && !tab.closed) {
+    useTab(ctx, tab.id);
+  }
+  const open = tab && !tab.closed && tab.blocking ? openDialogOn(ctx.active, tab.id) : undefined;
+  if (!tab || !open || open.id !== command.dialog) {
+    throw new CommandError(
+      "not_actionable",
+      `Dialog ${command.dialog} is not open. Take a snapshot to see the page.`,
+      "dialog_closed",
+    );
+  }
+  if (command.text !== undefined && open.type !== "prompt") {
+    throw new CommandError(
+      "invalid_argument",
+      `Dialog ${open.id} is not a prompt, so it takes no text.`,
+    );
+  }
+  const accept = command.action === "accept";
+  const text =
+    accept && open.type === "prompt" ? command.text ?? open.defaultPrompt ?? "" : undefined;
+  await closeDialog(ctx, tab, open, accept, text);
+  return { ok: true, effect: "applied", ...dialogNote(ctx.active, tab) };
+}
+
+async function closeDialog(
+  ctx: Context,
+  tab: Tab,
+  open: Dialog,
+  accept: boolean,
+  text: string | undefined,
+): Promise<void> {
+  touch(ctx);
+  ctx.job.answering = true;
+  let sent: boolean;
+  try {
+    sent = await tab.answerDialog(accept, text).then(
+      () => true,
+      () => false,
+    );
+    await waitWithin(ctx, open.closed, STEP_MS);
+  } finally {
+    ctx.job.answering = false;
+  }
+  if (open.open) {
+    throw new CommandError(
+      "dialog_pending",
+      `Dialog ${open.id} on tab ${tab.id} did not close. Answer it again.`,
+      "unanswered",
+      sent ? "unknown" : "none",
+    );
+  }
+  if (!sent) {
+    throw new CommandError(
+      "not_actionable",
+      `Dialog ${open.id} closed before the answer reached it. Check the page before you answer again.`,
+      "dialog_closed",
+    );
+  }
+}
+
 export async function press(
   ctx: Context,
   command: Extract<Command, { command: "press" }>,
 ): Promise<CommandResult> {
-  chordStroke(command.key);
+  const answered = await answer(ctx, command);
+  if (answered) {
+    return answered;
+  }
   let tab: Tab;
   if (command.target !== undefined) {
     const target = await element(ctx, { ...command, target: command.target });

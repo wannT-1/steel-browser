@@ -1,5 +1,6 @@
 import type { CDPSession, Protocol } from "puppeteer-core";
 import { _keyDefinitions, type KeyInput } from "puppeteer-core/internal/common/USKeyboardLayout.js";
+import { dialogHint } from "./dialogs.js";
 import { CommandError } from "./errors.js";
 import { sendOrDialog, type InputContext } from "./pointer.js";
 
@@ -100,6 +101,18 @@ export function chordStroke(chord: string, held = 0): { stroke: KeyStroke; modif
   return { stroke: keyStroke(parsed.key, modifiers), modifiers };
 }
 
+export const ONE_KEY = "takes one key. Hold each modifier with its own keyboard down.";
+
+const DIALOG_KEYS = new Map([
+  ["Enter", true],
+  ["Escape", false],
+]);
+
+export function dialogAnswer(chord: string): boolean | undefined {
+  const { stroke, modifiers } = chordStroke(chord);
+  return modifiers === 0 ? DIALOG_KEYS.get(stroke.key) : undefined;
+}
+
 export function modifierBit(key: string): number {
   return MODIFIER_BITS.get(key.toLowerCase()) ?? 0;
 }
@@ -182,7 +195,9 @@ export async function typeText(
     if (opened && typed < characters.length) {
       throw new CommandError(
         "dialog_pending",
-        `A dialog opened after ${typed} of ${characters.length} characters. Close it, then type the rest.`,
+        `A dialog opened after ${typed} of ${
+          characters.length
+        } characters. ${dialogHint()} Then type the rest.`,
         "during_type",
         "applied",
       );

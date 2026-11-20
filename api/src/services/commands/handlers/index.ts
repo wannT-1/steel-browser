@@ -2,17 +2,30 @@ import type { Command } from "../commands.js";
 import { CommandError } from "../errors.js";
 import type { CommandResult } from "../records.js";
 import { failed } from "../results.js";
-import type { Context } from "./context.js";
-import { check, drag, focus, pointer, press, scroll, select, upload, write } from "./elements.js";
+import { STEP_MS } from "../session.js";
+import { ending, type Context } from "./context.js";
+import {
+  check,
+  dialog,
+  drag,
+  focus,
+  pointer,
+  press,
+  scroll,
+  select,
+  upload,
+  write,
+} from "./elements.js";
 import { get, is, pdf, screenshot, wait } from "./inspect.js";
 import { history, navigate, reload, settle } from "./navigation.js";
 import { find, snapshot, tab } from "./pages.js";
-import { key, mouse } from "./raw.js";
+import { key, mouse, release as releaseInput } from "./raw.js";
 import { evaluate } from "./script.js";
 
 export {
   crashedTab,
   dialogNote,
+  heldNote,
   openDialogOn,
   pageInfo,
   watchBlocking,
@@ -22,7 +35,6 @@ export { observe } from "./pages.js";
 
 const SETTLES = new Set([
   "click",
-  "dblclick",
   "type",
   "fill",
   "press",
@@ -31,21 +43,37 @@ const SETTLES = new Set([
   "uncheck",
   "upload",
   "drag",
+  "keyboard",
   "keydown",
   "keyup",
   "mouse",
+  "release",
   "eval",
+  "dialog",
 ]);
 
 export async function execute(ctx: Context, command: Command): Promise<CommandResult> {
+  const before = SETTLES.has(command.command) ? ctx.active.tabs.ids() : undefined;
   try {
     const result = await dispatch(ctx, command);
-    return result.ok && SETTLES.has(command.command) ? await settle(ctx, result) : result;
+    return result.ok && before ? await arrivals(ctx, before, await settle(ctx, result)) : result;
   } catch (error) {
     return failed(error, ctx.job.touched ? "unknown" : "none");
   } finally {
     release(ctx);
   }
+}
+
+async function arrivals(
+  ctx: Context,
+  before: ReadonlySet<string>,
+  result: CommandResult,
+): Promise<CommandResult> {
+  if (!result.ok) {
+    return result;
+  }
+  const opened = await ctx.active.tabs.openedSince(before, STEP_MS, () => ending(ctx));
+  return opened.length > 0 ? { ...result, opened } : result;
 }
 
 function release(ctx: Context) {
@@ -70,7 +98,6 @@ async function dispatch(ctx: Context, command: Command): Promise<CommandResult> 
     case "snapshot":
       return await snapshot(ctx, command);
     case "click":
-    case "dblclick":
     case "hover":
       return await pointer(ctx, command);
     case "focus":
@@ -80,11 +107,14 @@ async function dispatch(ctx: Context, command: Command): Promise<CommandResult> 
       return await write(ctx, command);
     case "press":
       return await press(ctx, command);
+    case "keyboard":
     case "keydown":
     case "keyup":
       return await key(ctx, command);
     case "mouse":
       return await mouse(ctx, command);
+    case "release":
+      return await releaseInput(ctx, command);
     case "eval":
       return await evaluate(ctx, command);
     case "select":
@@ -112,6 +142,8 @@ async function dispatch(ctx: Context, command: Command): Promise<CommandResult> 
       return await find(ctx, command);
     case "tab":
       return await tab(ctx, command);
+    case "dialog":
+      return await dialog(ctx, command);
     default:
       throw new CommandError(
         "unknown_command",

@@ -7,12 +7,13 @@ import {
   type Command,
   type CommandRequest,
 } from "./commands.js";
-import { DIALOG_HINT, openDialog, type Dialog } from "./dialogs.js";
+import { dialogHint, openDialog, type Dialog } from "./dialogs.js";
 import { statusFor, type RequestErrorCode } from "./errors.js";
 import {
   crashedTab,
   dialogNote,
   execute,
+  heldNote,
   observe,
   openDialogOn,
   pageInfo,
@@ -20,7 +21,6 @@ import {
   type Context,
 } from "./handlers/index.js";
 import {
-  DIALOG_GONE,
   deprecationHeader,
   legacyControlSchema,
   upgradeLegacy,
@@ -259,9 +259,6 @@ export class CommandEngine {
     legacy: LegacyRequest,
     deadline: number,
   ): Promise<EngineResponse> {
-    if (legacy.forms.includes("dialog")) {
-      return failure("invalid_request", DIALOG_GONE);
-    }
     if (legacy.mixed) {
       return failure("invalid_request", "Send a control command on its own.");
     }
@@ -356,6 +353,7 @@ export class CommandEngine {
       current: null,
       inflight: null,
       touched: false,
+      answering: false,
       cancelled: false,
     });
     void this.pump(active);
@@ -374,6 +372,9 @@ export class CommandEngine {
     await this.settle(active, execution, deadline);
     if (active.ended) {
       return ended(active.id);
+    }
+    if (execution.state === "expired") {
+      return unknownExecution(id);
     }
     return ok(await this.envelope(active, execution, false));
   }
@@ -412,6 +413,9 @@ export class CommandEngine {
     if (active.ended) {
       return ended(active.id);
     }
+    if (execution.state === "expired") {
+      return unknownExecution(id);
+    }
     return ok(await this.envelope(active, execution, false));
   }
 
@@ -429,12 +433,7 @@ export class CommandEngine {
       this.expire(active, execution);
     }
     if (execution.state === "expired") {
-      return failure(
-        "expired",
-        "The execution could not start before the response deadline. Send the same request again.",
-        {},
-        1,
-      );
+      return expired();
     }
     execution.next ??= active.records.issue(execution);
     return ok(await this.envelope(active, execution, replayed));
@@ -469,10 +468,20 @@ export class CommandEngine {
       : (await within(pageInfo(active, execution.tab), STEP_MS)) ?? null;
     return {
       id: execution.id,
-      ...(execution.next ? { next: execution.next } : {}),
-      epoch: active.records.epoch,
-      ...(execution.epochChanged !== undefined ? { epochChanged: execution.epochChanged } : {}),
+      state: execution.state,
+      effect: execution.effect,
+      ran: execution.ran,
+      ...(execution.error ? { stopped: execution.error } : {}),
+      results: execution.results,
+      ...(execution.observe ? { observe: execution.observe } : {}),
       page,
+      ...dialogNote(active, execution.tab ? active.tabs.get(execution.tab) : undefined),
+      ...heldNote(active),
+      ...(execution.next ? { next: execution.next } : {}),
+      ...(execution.epochChanged !== undefined ? { epochChanged: execution.epochChanged } : {}),
+      replayed,
+      ...(execution.bodyExpired ? { bodyExpired: true } : {}),
+      epoch: active.records.epoch,
       execution: {
         id: execution.id,
         state: execution.state,
@@ -481,10 +490,6 @@ export class CommandEngine {
         ran: execution.ran,
         ...(execution.error ? { error: execution.error } : {}),
       },
-      results: execution.results,
-      ...dialogNote(active, execution.tab ? active.tabs.get(execution.tab) : undefined),
-      ...(execution.observe ? { observe: execution.observe } : {}),
-      ...(execution.bodyExpired ? { bodyExpired: true } : {}),
     };
   }
 
@@ -543,6 +548,7 @@ export class CommandEngine {
         return;
       }
       job.touched = false;
+      job.answering = false;
       job.tab = undefined;
       execution.ran++;
       const ctx = this.context(active, job);
@@ -556,7 +562,7 @@ export class CommandEngine {
         break;
       }
     }
-    if (job.observe && job.observe.mode !== "none") {
+    if (job.observe) {
       if (await this.stopped(active, job)) {
         return;
       }
@@ -634,9 +640,10 @@ export class CommandEngine {
           return undefined;
         }
         const tab = job.tab ? active.tabs.get(job.tab) : undefined;
-        const watch = tab
-          ? watchBlocking(tab, !(command && RECOVERS.has(command.command)))
-          : undefined;
+        const watch =
+          tab && !job.answering
+            ? watchBlocking(tab, !(command && RECOVERS.has(command.command)))
+            : undefined;
         let result = await within<T | typeof BLOCKED>(
           watch
             ? Promise.race<T | typeof BLOCKED>([
@@ -676,11 +683,12 @@ export class CommandEngine {
       return command ? { ok: false, effect: job.touched ? "unknown" : "none", error } : { error };
     }
     const dialog = openDialogOn(active, job.tab);
+    const hint = dialogHint(job.tab, dialog?.id);
     const error = {
       code: "dialog_pending",
       message: dialog
-        ? `Tab ${dialog.tab} shows ${dialog.type} dialog ${dialog.id}: "${dialog.message}". ${DIALOG_HINT}`
-        : `A dialog opened and blocked the page. ${DIALOG_HINT}`,
+        ? `Tab ${dialog.tab} shows ${dialog.type} dialog ${dialog.id}: "${dialog.message}". ${hint}`
+        : `A dialog opened and blocked the page. ${hint}`,
     };
     if (!command) {
       return { error };
@@ -852,6 +860,7 @@ export class CommandEngine {
 
   private closeDialog(dialog: Dialog) {
     dialog.open = false;
+    dialog.close();
   }
 
   private closeDialogs(active: ActiveSession) {
@@ -907,6 +916,15 @@ function failure(
     headers: retryAfter ? { "retry-after": String(retryAfter) } : {},
     body: { ...fields, error: { code, message } },
   };
+}
+
+function expired(): EngineResponse {
+  return failure(
+    "expired",
+    "The execution could not start before the response deadline. Send the same request again.",
+    {},
+    1,
+  );
 }
 
 function ended(sessionId: string): EngineResponse {
