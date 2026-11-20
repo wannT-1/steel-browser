@@ -20,6 +20,10 @@ const CLOSE_WAIT_MS = 5_000;
 
 const OPEN_MS = 10_000;
 
+const ARRIVAL_MS = 2_000;
+
+const ARRIVAL_POLL_MS = 20;
+
 type Hook = (session: CDPSession) => void;
 
 export interface BrowserHost {
@@ -51,6 +55,7 @@ export interface PressedButton {
 export interface HeldKey {
   session: CDPSession;
   keyUp: Protocol.Input.DispatchKeyEventRequest;
+  name?: string;
 }
 
 function targetIdOf(target: Target): string {
@@ -83,6 +88,7 @@ export class Tab {
   closed = false;
   blocking = false;
   crashed = false;
+  commits = 0;
   pressed: PressedButton | null = null;
   key: HeldKey | null = null;
   pointer: { x: number; y: number } | null = null;
@@ -111,6 +117,7 @@ export class Tab {
   };
   private readonly onCrashed = () => {
     this.crashed = true;
+    this.forgetInput();
     this.settle();
     for (const listener of [...this.blockingListeners]) {
       listener();
@@ -125,6 +132,7 @@ export class Tab {
   private readonly onFrameNavigated = (event: Protocol.Page.FrameNavigatedEvent) => {
     if (!event.frame.parentId) {
       this.crashed = false;
+      this.commits++;
       if (this.navigation) {
         this.navigation.committed = true;
         this.navigation.loaderId = event.frame.loaderId;
@@ -222,6 +230,16 @@ export class Tab {
     };
   }
 
+  async answerDialog(accept: boolean, text?: string) {
+    if (!this.client) {
+      throw new CommandError("tab_not_found", `Tab ${this.id} is not ready.`);
+    }
+    await this.client.send("Page.handleJavaScriptDialog", {
+      accept,
+      ...(text !== undefined ? { promptText: text } : {}),
+    });
+  }
+
   async terminate() {
     const sessions = new Set(
       [this.client, ...this.sessions()].filter(
@@ -243,13 +261,24 @@ export class Tab {
     return this.pressed !== null || this.key !== null || this.held.size > 0;
   }
 
+  heldInput(): { keys: string[]; button?: "left" | "right" | "middle" } {
+    const keys = new Set<string>();
+    for (const key of [this.key, ...this.held.values()]) {
+      const name = key?.name ?? key?.keyUp.key;
+      if (name) {
+        keys.add(name);
+      }
+    }
+    return {
+      keys: [...keys],
+      ...(this.pressed ? { button: this.pressed.button ?? "left" } : {}),
+    };
+  }
+
   async release() {
     const pressed = this.pressed;
     const keys = [this.key, ...this.held.values()];
-    this.pressed = null;
-    this.key = null;
-    this.held.clear();
-    this.modifiers = 0;
+    this.forgetInput();
     await pressed?.session.send("Input.dispatchMouseEvent", {
       type: "mouseReleased",
       x: pressed.x,
@@ -261,6 +290,13 @@ export class Tab {
     for (const key of keys) {
       await key?.session.send("Input.dispatchKeyEvent", key.keyUp);
     }
+  }
+
+  private forgetInput() {
+    this.pressed = null;
+    this.key = null;
+    this.held.clear();
+    this.modifiers = 0;
   }
 
   async page(): Promise<Page> {
@@ -532,11 +568,29 @@ export class TabRegistry {
   private connection: Connection | null = null;
   private readonly tabs = new Map<string, Tab>();
   private readonly byTarget = new Map<string, Tab>();
+  private readonly arriving = new Map<string, number>();
   private readonly onCreated = (target: Target) => {
     this.track(target);
   };
   private readonly onDestroyed = (target: Target) => {
     this.untrack(targetIdOf(target));
+  };
+  private readonly onArriving = ({ targetInfo }: Protocol.Target.TargetCreatedEvent) => {
+    const elsewhere =
+      this.defaultContextId !== null &&
+      targetInfo.browserContextId !== undefined &&
+      targetInfo.browserContextId !== this.defaultContextId;
+    if (
+      targetInfo.type === "page" &&
+      !targetInfo.subtype &&
+      !elsewhere &&
+      !this.byTarget.has(targetInfo.targetId)
+    ) {
+      this.arriving.set(targetInfo.targetId, Date.now());
+    }
+  };
+  private readonly onGone = ({ targetId }: Protocol.Target.TargetDestroyedEvent) => {
+    this.arriving.delete(targetId);
   };
 
   constructor(
@@ -558,6 +612,8 @@ export class TabRegistry {
       this.track(target);
     }
     this.connection = connectionOf(browser);
+    this.connection?.on("Target.targetCreated", this.onArriving);
+    this.connection?.on("Target.targetDestroyed", this.onGone);
     void this.learnDefaultContext(browser);
   }
 
@@ -566,6 +622,9 @@ export class TabRegistry {
       this.browser.off("targetcreated", this.onCreated);
       this.browser.off("targetdestroyed", this.onDestroyed);
     }
+    this.connection?.off("Target.targetCreated", this.onArriving);
+    this.connection?.off("Target.targetDestroyed", this.onGone);
+    this.arriving.clear();
     this.connection = null;
     for (const tab of this.tabs.values()) {
       tab.close();
@@ -612,6 +671,34 @@ export class TabRegistry {
 
   list(): Tab[] {
     return [...this.tabs.values()].filter((tab) => !tab.closed);
+  }
+
+  ids(): Set<string> {
+    return new Set(this.list().map((tab) => tab.id));
+  }
+
+  async openedSince(
+    before: ReadonlySet<string>,
+    waitMs: number,
+    stopped: () => boolean,
+  ): Promise<string[]> {
+    const until = Date.now() + waitMs;
+    while (this.expecting() && Date.now() < until && !stopped()) {
+      await new Promise((resolve) => setTimeout(resolve, ARRIVAL_POLL_MS));
+    }
+    return this.list()
+      .filter((tab) => !before.has(tab.id))
+      .map((tab) => tab.id);
+  }
+
+  private expecting(): boolean {
+    const now = Date.now();
+    for (const [targetId, since] of this.arriving) {
+      if (now - since > ARRIVAL_MS) {
+        this.arriving.delete(targetId);
+      }
+    }
+    return this.arriving.size > 0;
   }
 
   resolve(id?: string): Tab {
@@ -704,6 +791,7 @@ export class TabRegistry {
   }
 
   private track(target: Target): Tab | undefined {
+    this.arriving.delete(targetIdOf(target));
     if (
       target.type() !== "page" ||
       target.browserContext() !== this.browser?.defaultBrowserContext()

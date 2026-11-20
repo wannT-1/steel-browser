@@ -1,5 +1,5 @@
 import type { Page } from "puppeteer-core";
-import { DIALOG_HINT, describeDialog, type Dialog } from "../dialogs.js";
+import { describeDialog, dialogHint, type Dialog } from "../dialogs.js";
 import { CommandError } from "../errors.js";
 import type { InputContext, Watch } from "../pointer.js";
 import { isFinal } from "../records.js";
@@ -59,11 +59,12 @@ export function usable(ctx: Context, tab: Tab, crashed = false): Tab {
     return tab;
   }
   const dialog = openDialogOn(ctx.active, tab.id);
+  const hint = `${dialogHint(tab.id, dialog?.id)} Then send the command again.`;
   throw new CommandError(
     "dialog_pending",
     dialog
-      ? `Tab ${tab.id} shows ${dialog.type} dialog ${dialog.id}: "${dialog.message}". ${DIALOG_HINT} Then send the command again.`
-      : `Tab ${tab.id} shows a dialog. ${DIALOG_HINT} Then send the command again.`,
+      ? `Tab ${tab.id} shows ${dialog.type} dialog ${dialog.id}: "${dialog.message}". ${hint}`
+      : `Tab ${tab.id} shows a dialog. ${hint}`,
   );
 }
 
@@ -91,6 +92,16 @@ export function dialogNote(
 ): { dialog?: ReturnType<typeof describeDialog> } {
   const dialog = tab?.blocking ? openDialogOn(active, tab.id) : undefined;
   return dialog ? { dialog: describeDialog(dialog) } : {};
+}
+
+export function heldNote(active: ActiveSession): {
+  held?: Array<{ tab: string } & ReturnType<Tab["heldInput"]>>;
+} {
+  const held = active.tabs
+    .list()
+    .filter((tab) => tab.holding())
+    .map((tab) => ({ tab: tab.id, ...tab.heldInput() }));
+  return held.length > 0 ? { held } : {};
 }
 
 export function watchBlocking(tab: Tab, crashes = true): Watch {
@@ -232,19 +243,36 @@ export async function load(ctx: Context, tab: Tab, loading: Promise<unknown>) {
   }
 }
 
-export async function goto(ctx: Context, tab: Tab, url: string): Promise<Page> {
-  const page = await tab.navigable();
-  touch(ctx);
+export async function arrive(
+  ctx: Context,
+  tab: Tab,
+  url: string,
+  start: () => Promise<unknown>,
+): Promise<{ loading?: true }> {
+  const commits = tab.commits;
   try {
-    await load(
-      ctx,
-      tab,
-      page.goto(url, { waitUntil: "load", timeout: ctx.limits.navigationTimeoutMs }),
-    );
+    await load(ctx, tab, start());
+    return {};
   } catch (error) {
+    const slow = error instanceof Error && error.name === "TimeoutError";
+    if (slow && tab.commits > commits && !tab.navigating) {
+      return { loading: true };
+    }
     throw navigationError(error, url, ctx.limits.navigationTimeoutMs);
   }
-  return page;
+}
+
+export async function goto(
+  ctx: Context,
+  tab: Tab,
+  url: string,
+): Promise<{ url: string; loading?: true }> {
+  const page = await tab.navigable();
+  touch(ctx);
+  const arrived = await arrive(ctx, tab, url, () =>
+    page.goto(url, { waitUntil: "load", timeout: ctx.limits.navigationTimeoutMs }),
+  );
+  return { url: page.url(), ...arrived };
 }
 
 export async function capture(
@@ -309,7 +337,7 @@ export async function pageInfo(active: ActiveSession, tabId?: string): Promise<T
   return active.tabs.info(tab).catch(() => null);
 }
 
-function stopped(ctx: Context): CommandError {
+export function stopped(ctx: Context): CommandError {
   return new CommandError(
     "cancelled",
     "The command stopped because its execution ended.",

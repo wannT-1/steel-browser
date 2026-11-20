@@ -50,7 +50,7 @@ Under the hood, it manages sessions, pages, and browser processes, allowing you 
 - **Session Management**: Maintains browser state, cookies, and local storage across requests
 - **Proxy Support**: Built-in proxy chain management for IP rotation
 - **Extension Support**: Load custom Chrome extensions for enhanced functionality
-- **Debugging Tools**: Built-in request logging and a UI to view/debug sessions with
+- **Debugging Tools**: Built-in request logging, plus a UI to watch sessions live and replay them
 - **Anti-Detection**: Includes stealth plugins and fingerprint management
 - **Resource Management**: Automatic cleanup and browser lifecycle management
 - **Browser Tools**: Exposes APIs to quick convert pages to markdown, readability, screenshots, or PDFs.
@@ -158,6 +158,17 @@ npm run dev
 ```
 
 For more details on where this is checked look at [`api/src/utils/browser.ts`](./api/src/utils/browser.ts).
+
+#### Self-hosted GPU
+
+Chrome starts with software GL (`--disable-gpu`, and `--use-gl=swiftshader` for headed sessions). Leaving the variables unset keeps that default, including for Steel Cloud deployments that do not set them. On a self-hosted machine with a GPU, opt into hardware GL for every session on this deployment:
+
+```bash
+export CHROME_USE_GL=angle
+export CHROME_DISABLE_GPU=false
+```
+
+`CHROME_USE_GL` is Chrome's `--use-gl` value (`angle`, `egl`, `desktop`, or `swiftshader`). `CHROME_DISABLE_GPU` defaults to true and passes `--disable-gpu`; set it to `false` to leave that flag off. Hardware GL uses both. Pass the same variables with `docker run -e`, or set them in `.env` for Docker Compose. See [`.env.example`](./.env.example) and [`api/.env.example`](./api/.env.example). These are deployment settings. Session create options are unchanged.
 
 ## 🏄🏽‍♂️ Usage
 
